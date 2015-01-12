@@ -1,8 +1,11 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
 import sys
 
 from twisted.internet import reactor
 from twisted.web.client import Agent
-from twisted.web_http_headers import Headers
+from twisted.web.http_headers import Headers
 
 def printHeaders(response):
     print 'HTTP version:', response.version

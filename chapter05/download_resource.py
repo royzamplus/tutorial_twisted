@@ -1,3 +1,6 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
 from twisted.internet import reactor
 from twisted.web.client import downloadPage
 import sys
