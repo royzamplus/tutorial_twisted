@@ -1,2 +1,4 @@
-2015-01-13 17:32:14+0800 [-] Log opened.
-2015-01-13 17:32:14+0800 [-] --> test_foo.MyFirstTestCase.test_something <--
+2015-01-14 09:50:44+0800 [-] Log opened.
+2015-01-14 09:50:44+0800 [-] --> test_chat.ChatServerTestCase.test_chat <--
+2015-01-14 09:50:45+0800 [-] --> test_chat.ChatServerTestCase.test_connect <--
+2015-01-14 09:50:45+0800 [-] --> test_chat.ChatServerTestCase.test_register <--

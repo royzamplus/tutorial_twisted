@@ -1,0 +1,410 @@
+       # Copyright (c) Twisted Matrix Laboratories.
+       # See LICENSE for details.
+       
+       """
+       An epoll() based implementation of the twisted main loop.
+       
+       To install the event loop (and you should do this before any connections,
+       listeners or connectors are added)::
+       
+           from twisted.internet import epollreactor
+           epollreactor.install()
+    1: """
+       
+    1: from __future__ import division, absolute_import
+       
+    1: from select import epoll, EPOLLHUP, EPOLLERR, EPOLLIN, EPOLLOUT
+    1: import errno
+       
+    1: from zope.interface import implementer
+       
+    1: from twisted.internet.interfaces import IReactorFDSet
+       
+    1: from twisted.python import log
+    1: from twisted.internet import posixbase
+       
+       
+       
+    2: @implementer(IReactorFDSet)
+    1: class _ContinuousPolling(posixbase._PollLikeMixin,
+    1:                          posixbase._DisconnectSelectableMixin):
+           """
+           Schedule reads and writes based on the passage of time, rather than
+           notification.
+       
+           This is useful for supporting polling filesystem files, which C{epoll(7)}
+           does not support.
+       
+           The implementation uses L{posixbase._PollLikeMixin}, which is a bit hacky,
+           but re-implementing and testing the relevant code yet again is
+           unappealing.
+       
+           @ivar _reactor: The L{EPollReactor} that is using this instance.
+       
+           @ivar _loop: A C{LoopingCall} that drives the polling, or C{None}.
+       
+           @ivar _readers: A C{set} of C{FileDescriptor} objects that should be read
+               from.
+       
+           @ivar _writers: A C{set} of C{FileDescriptor} objects that should be
+               written to.
+    1:     """
+       
+           # Attributes for _PollLikeMixin
+    1:     _POLL_DISCONNECTED = 1
+    1:     _POLL_IN = 2
+    1:     _POLL_OUT = 4
+       
+       
+    1:     def __init__(self, reactor):
+    1:         self._reactor = reactor
+    1:         self._loop = None
+    1:         self._readers = set()
+    1:         self._writers = set()
+       
+       
+    1:     def _checkLoop(self):
+               """
+               Start or stop a C{LoopingCall} based on whether there are readers and
+               writers.
+               """
+>>>>>>         if self._readers or self._writers:
+>>>>>>             if self._loop is None:
+>>>>>>                 from twisted.internet.task import LoopingCall, _EPSILON
+>>>>>>                 self._loop = LoopingCall(self.iterate)
+>>>>>>                 self._loop.clock = self._reactor
+                       # LoopingCall seems unhappy with timeout of 0, so use very
+                       # small number:
+>>>>>>                 self._loop.start(_EPSILON, now=False)
+>>>>>>         elif self._loop:
+>>>>>>             self._loop.stop()
+>>>>>>             self._loop = None
+       
+       
+    1:     def iterate(self):
+               """
+               Call C{doRead} and C{doWrite} on all readers and writers respectively.
+               """
+>>>>>>         for reader in list(self._readers):
+>>>>>>             self._doReadOrWrite(reader, reader, self._POLL_IN)
+>>>>>>         for reader in list(self._writers):
+>>>>>>             self._doReadOrWrite(reader, reader, self._POLL_OUT)
+       
+       
+    1:     def addReader(self, reader):
+               """
+               Add a C{FileDescriptor} for notification of data available to read.
+               """
+>>>>>>         self._readers.add(reader)
+>>>>>>         self._checkLoop()
+       
+       
+    1:     def addWriter(self, writer):
+               """
+               Add a C{FileDescriptor} for notification of data available to write.
+               """
+>>>>>>         self._writers.add(writer)
+>>>>>>         self._checkLoop()
+       
+       
+    1:     def removeReader(self, reader):
+               """
+               Remove a C{FileDescriptor} from notification of data available to read.
+               """
+>>>>>>         try:
+>>>>>>             self._readers.remove(reader)
+>>>>>>         except KeyError:
+>>>>>>             return
+>>>>>>         self._checkLoop()
+       
+       
+    1:     def removeWriter(self, writer):
+               """
+               Remove a C{FileDescriptor} from notification of data available to
+               write.
+               """
+>>>>>>         try:
+>>>>>>             self._writers.remove(writer)
+>>>>>>         except KeyError:
+>>>>>>             return
+>>>>>>         self._checkLoop()
+       
+       
+    1:     def removeAll(self):
+               """
+               Remove all readers and writers.
+               """
+    4:         result = list(self._readers | self._writers)
+               # Don't reset to new value, since self.isWriting and .isReading refer
+               # to the existing instance:
+    4:         self._readers.clear()
+    4:         self._writers.clear()
+    4:         return result
+       
+       
+    1:     def getReaders(self):
+               """
+               Return a list of the readers.
+               """
+>>>>>>         return list(self._readers)
+       
+       
+    1:     def getWriters(self):
+               """
+               Return a list of the writers.
+               """
+>>>>>>         return list(self._writers)
+       
+       
+    1:     def isReading(self, fd):
+               """
+               Checks if the file descriptor is currently being observed for read
+               readiness.
+       
+               @param fd: The file descriptor being checked.
+               @type fd: L{twisted.internet.abstract.FileDescriptor}
+               @return: C{True} if the file descriptor is being observed for read
+                   readiness, C{False} otherwise.
+               @rtype: C{bool}
+               """
+>>>>>>         return fd in self._readers
+       
+       
+    1:     def isWriting(self, fd):
+               """
+               Checks if the file descriptor is currently being observed for write
+               readiness.
+       
+               @param fd: The file descriptor being checked.
+               @type fd: L{twisted.internet.abstract.FileDescriptor}
+               @return: C{True} if the file descriptor is being observed for write
+                   readiness, C{False} otherwise.
+               @rtype: C{bool}
+               """
+>>>>>>         return fd in self._writers
+       
+       
+       
+    2: @implementer(IReactorFDSet)
+    1: class EPollReactor(posixbase.PosixReactorBase, posixbase._PollLikeMixin):
+           """
+           A reactor that uses epoll(7).
+       
+           @ivar _poller: A C{epoll} which will be used to check for I/O
+               readiness.
+       
+           @ivar _selectables: A dictionary mapping integer file descriptors to
+               instances of C{FileDescriptor} which have been registered with the
+               reactor.  All C{FileDescriptors} which are currently receiving read or
+               write readiness notifications will be present as values in this
+               dictionary.
+       
+           @ivar _reads: A set containing integer file descriptors.  Values in this
+               set will be registered with C{_poller} for read readiness notifications
+               which will be dispatched to the corresponding C{FileDescriptor}
+               instances in C{_selectables}.
+       
+           @ivar _writes: A set containing integer file descriptors.  Values in this
+               set will be registered with C{_poller} for write readiness
+               notifications which will be dispatched to the corresponding
+               C{FileDescriptor} instances in C{_selectables}.
+       
+           @ivar _continuousPolling: A L{_ContinuousPolling} instance, used to handle
+               file descriptors (e.g. filesytem files) that are not supported by
+               C{epoll(7)}.
+    1:     """
+       
+           # Attributes for _PollLikeMixin
+    1:     _POLL_DISCONNECTED = (EPOLLHUP | EPOLLERR)
+    1:     _POLL_IN = EPOLLIN
+    1:     _POLL_OUT = EPOLLOUT
+       
+    1:     def __init__(self):
+               """
+               Initialize epoll object, file descriptor tracking dictionaries, and the
+               base class.
+               """
+               # Create the poller we're going to use.  The 1024 here is just a hint
+               # to the kernel, it is not a hard maximum.  After Linux 2.6.8, the size
+               # argument is completely ignored.
+    1:         self._poller = epoll(1024)
+    1:         self._reads = set()
+    1:         self._writes = set()
+    1:         self._selectables = {}
+    1:         self._continuousPolling = _ContinuousPolling(self)
+    1:         posixbase.PosixReactorBase.__init__(self)
+       
+       
+    1:     def _add(self, xer, primary, other, selectables, event, antievent):
+               """
+               Private method for adding a descriptor from the event loop.
+       
+               It takes care of adding it if  new or modifying it if already added
+               for another state (read -> read/write for example).
+               """
+    1:         fd = xer.fileno()
+    1:         if fd not in primary:
+    1:             flags = event
+                   # epoll_ctl can raise all kinds of IOErrors, and every one
+                   # indicates a bug either in the reactor or application-code.
+                   # Let them all through so someone sees a traceback and fixes
+                   # something.  We'll do the same thing for every other call to
+                   # this method in this file.
+    1:             if fd in other:
+>>>>>>                 flags |= antievent
+>>>>>>                 self._poller.modify(fd, flags)
+                   else:
+    1:                 self._poller.register(fd, flags)
+       
+                   # Update our own tracking state *only* after the epoll call has
+                   # succeeded.  Otherwise we may get out of sync.
+    1:             primary.add(fd)
+    1:             selectables[fd] = xer
+       
+       
+    1:     def addReader(self, reader):
+               """
+               Add a FileDescriptor for notification of data available to read.
+               """
+    1:         try:
+    1:             self._add(reader, self._reads, self._writes, self._selectables,
+    1:                       EPOLLIN, EPOLLOUT)
+>>>>>>         except IOError as e:
+>>>>>>             if e.errno == errno.EPERM:
+                       # epoll(7) doesn't support certain file descriptors,
+                       # e.g. filesystem files, so for those we just poll
+                       # continuously:
+>>>>>>                 self._continuousPolling.addReader(reader)
+                   else:
+>>>>>>                 raise
+       
+       
+    1:     def addWriter(self, writer):
+               """
+               Add a FileDescriptor for notification of data available to write.
+               """
+>>>>>>         try:
+>>>>>>             self._add(writer, self._writes, self._reads, self._selectables,
+>>>>>>                       EPOLLOUT, EPOLLIN)
+>>>>>>         except IOError as e:
+>>>>>>             if e.errno == errno.EPERM:
+                       # epoll(7) doesn't support certain file descriptors,
+                       # e.g. filesystem files, so for those we just poll
+                       # continuously:
+>>>>>>                 self._continuousPolling.addWriter(writer)
+                   else:
+>>>>>>                 raise
+       
+       
+    1:     def _remove(self, xer, primary, other, selectables, event, antievent):
+               """
+               Private method for removing a descriptor from the event loop.
+       
+               It does the inverse job of _add, and also add a check in case of the fd
+               has gone away.
+               """
+>>>>>>         fd = xer.fileno()
+>>>>>>         if fd == -1:
+>>>>>>             for fd, fdes in selectables.items():
+>>>>>>                 if xer is fdes:
+>>>>>>                     break
+                   else:
+>>>>>>                 return
+>>>>>>         if fd in primary:
+>>>>>>             if fd in other:
+>>>>>>                 flags = antievent
+                       # See comment above modify call in _add.
+>>>>>>                 self._poller.modify(fd, flags)
+                   else:
+>>>>>>                 del selectables[fd]
+                       # See comment above _control call in _add.
+>>>>>>                 self._poller.unregister(fd)
+>>>>>>             primary.remove(fd)
+       
+       
+    1:     def removeReader(self, reader):
+               """
+               Remove a Selectable for notification of data available to read.
+               """
+>>>>>>         if self._continuousPolling.isReading(reader):
+>>>>>>             self._continuousPolling.removeReader(reader)
+>>>>>>             return
+>>>>>>         self._remove(reader, self._reads, self._writes, self._selectables,
+>>>>>>                      EPOLLIN, EPOLLOUT)
+       
+       
+    1:     def removeWriter(self, writer):
+               """
+               Remove a Selectable for notification of data available to write.
+               """
+>>>>>>         if self._continuousPolling.isWriting(writer):
+>>>>>>             self._continuousPolling.removeWriter(writer)
+>>>>>>             return
+>>>>>>         self._remove(writer, self._writes, self._reads, self._selectables,
+>>>>>>                      EPOLLOUT, EPOLLIN)
+       
+       
+    1:     def removeAll(self):
+               """
+               Remove all selectables, and return a list of them.
+               """
+    4:         return (self._removeAll(
+    8:                 [self._selectables[fd] for fd in self._reads],
+    4:                 [self._selectables[fd] for fd in self._writes]) +
+    4:                 self._continuousPolling.removeAll())
+       
+       
+    1:     def getReaders(self):
+>>>>>>         return ([self._selectables[fd] for fd in self._reads] +
+>>>>>>                 self._continuousPolling.getReaders())
+       
+       
+    1:     def getWriters(self):
+>>>>>>         return ([self._selectables[fd] for fd in self._writes] +
+>>>>>>                 self._continuousPolling.getWriters())
+       
+       
+    1:     def doPoll(self, timeout):
+               """
+               Poll the poller for new events.
+               """
+   12:         if timeout is None:
+>>>>>>             timeout = -1  # Wait indefinitely.
+       
+   12:         try:
+                   # Limit the number of events to the number of io objects we're
+                   # currently tracking (because that's maybe a good heuristic) and
+                   # the amount of time we block to the value specified by our
+                   # caller.
+   12:             l = self._poller.poll(timeout, len(self._selectables))
+>>>>>>         except IOError as err:
+>>>>>>             if err.errno == errno.EINTR:
+>>>>>>                 return
+                   # See epoll_wait(2) for documentation on the other conditions
+                   # under which this can fail.  They can only be due to a serious
+                   # programming error on our part, so let's just announce them
+                   # loudly.
+>>>>>>             raise
+       
+   12:         _drdw = self._doReadOrWrite
+   12:         for fd, event in l:
+>>>>>>             try:
+>>>>>>                 selectable = self._selectables[fd]
+>>>>>>             except KeyError:
+>>>>>>                 pass
+                   else:
+>>>>>>                 log.callWithLogger(selectable, _drdw, selectable, fd, event)
+       
+    1:     doIteration = doPoll
+       
+       
+    1: def install():
+           """
+           Install the epoll() reactor.
+           """
+    1:     p = EPollReactor()
+    1:     from twisted.internet.main import installReactor
+    1:     installReactor(p)
+       
+       
+    1: __all__ = ["EPollReactor", "install"]

@@ -1,0 +1,36 @@
+       # Copyright (c) Twisted Matrix Laboratories.
+       # See LICENSE for details.
+       
+    1: numberSections = None
+    1: filenum = None
+       
+       
+    1: def reset():
+    1:     resetFilenum()
+    1:     setNumberSections(False)
+       
+    1: def resetFilenum():
+    1:     setFilenum(0)
+       
+    1: def setFilenum(arg):
+           global filenum
+    1:     filenum = arg
+       
+    1: def getFilenum():
+           global filenum
+>>>>>>     return filenum
+       
+    1: def getNextFilenum():
+           global filenum
+>>>>>>     filenum += 1
+>>>>>>     return filenum
+       
+    1: def setNumberSections(arg):
+           global numberSections
+    1:     numberSections = arg
+       
+    1: def getNumberSections():
+           global numberSections
+>>>>>>     return numberSections
+       
+    1: reset()

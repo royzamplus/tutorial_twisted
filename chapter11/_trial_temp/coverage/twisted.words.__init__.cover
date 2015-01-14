@@ -1,0 +1,11 @@
+       # -*- test-case-name: twisted.words.test -*-
+       # Copyright (c) Twisted Matrix Laboratories.
+       # See LICENSE for details.
+       
+       
+       """
+       Twisted Words: a Twisted Chat service.
+    1: """
+       
+    1: from twisted.words._version import version
+    1: __version__ = version.short()

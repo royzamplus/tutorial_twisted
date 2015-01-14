@@ -12,5 +12,5 @@ class EchoServerTestCase(unittest.TestCase):
         self.transport = proto_helpers.StringTransport()
 
         self.proto.makeConnection(self.transport)
-        self.proto.dateReceived("test\r\n")
+        self.proto.dataReceived("test\r\n")
         self.assertEqual(self.transport.value(), "test\r\n")

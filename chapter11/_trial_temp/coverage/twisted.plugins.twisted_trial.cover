@@ -1,0 +1,59 @@
+       
+    1: from zope.interface import implements
+       
+    1: from twisted.trial.itrial import IReporter
+    1: from twisted.plugin import IPlugin
+       
+    2: class _Reporter(object):
+    1:     implements(IPlugin, IReporter)
+       
+    1:     def __init__(self, name, module, description, longOpt, shortOpt, klass):
+    6:         self.name = name
+    6:         self.module = module
+    6:         self.description = description
+    6:         self.longOpt = longOpt
+    6:         self.shortOpt = shortOpt
+    6:         self.klass = klass
+       
+       
+    1: Tree = _Reporter("Tree Reporter",
+    1:                  "twisted.trial.reporter",
+    1:                  description="verbose color output (default reporter)",
+    1:                  longOpt="verbose",
+    1:                  shortOpt="v",
+    1:                  klass="TreeReporter")
+       
+    1: BlackAndWhite = _Reporter("Black-And-White Reporter",
+    1:                           "twisted.trial.reporter",
+    1:                           description="Colorless verbose output",
+    1:                           longOpt="bwverbose",
+    1:                           shortOpt="o",
+    1:                           klass="VerboseTextReporter")
+       
+    1: Minimal = _Reporter("Minimal Reporter",
+    1:                     "twisted.trial.reporter",
+    1:                     description="minimal summary output",
+    1:                     longOpt="summary",
+    1:                     shortOpt="s",
+    1:                     klass="MinimalReporter")
+       
+    1: Classic = _Reporter("Classic Reporter",
+    1:                     "twisted.trial.reporter",
+    1:                     description="terse text output",
+    1:                     longOpt="text",
+    1:                     shortOpt="t",
+    1:                     klass="TextReporter")
+       
+    1: Timing = _Reporter("Timing Reporter",
+    1:                    "twisted.trial.reporter",
+    1:                    description="Timing output",
+    1:                    longOpt="timing",
+    1:                    shortOpt=None,
+    1:                    klass="TimingTextReporter")
+       
+    1: Subunit = _Reporter("Subunit Reporter",
+    1:                     "twisted.trial.reporter",
+    1:                     description="subunit output",
+    1:                     longOpt="subunit",
+    1:                     shortOpt=None,
+    1:                     klass="SubunitReporter")

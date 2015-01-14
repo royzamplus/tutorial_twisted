@@ -1,0 +1,37 @@
+       #!/usr/bin/env python
+       # -*- coding: utf-8 -*-
+       
+    1: from twisted.test import proto_helpers
+    1: from twisted.trial import unittest
+       
+    1: from chatserver import ChatFactory
+       
+    2: class ChatServerTestCase(unittest.TestCase):
+    1:     def setUp(self):
+    3:         self.factory = ChatFactory()
+    3:         self.proto = self.factory.buildProtocol(('localhost', 0))
+    3:         self.transport = proto_helpers.StringTransport()
+    3:         self.proto.makeConnection(self.transport)
+       
+    1:     def test_connect(self):
+    1:         self.assertEqual(self.transport.value(), 
+    1:                          "What's your name?\r\n")
+       
+    1:     def test_register(self):
+    1:         self.assertEqual(self.proto.state, "REGISTER")
+    1:         self.proto.lineReceived("jesstess")
+    1:         self.assertIn("jesstess", self.proto.factory.users)
+    1:         self.assertEqual(self.proto.state, "CHAT")
+       
+    1:     def test_chat(self):
+    1:         self.proto.lineReceived("jesstess")
+       
+    1:         proto2 = self.factory.buildProtocol(("localhost", 0))
+    1:         transport2 = proto_helpers.StringTransport()
+    1:         proto2.makeConnection(transport2)
+       
+    1:         self.transport.clear()
+    1:         proto2.lineReceived("adamf")
+       
+    1:         self.assertEqual(self.transport.value(),
+    1:                          "adamf has joined the channel.\r\n")

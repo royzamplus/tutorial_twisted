@@ -1,0 +1,65 @@
+       # -*- test-case-name: twisted.test.test_process -*-
+       # Copyright (c) Twisted Matrix Laboratories.
+       # See LICENSE for details.
+       
+       """
+       Cross-platform process-related functionality used by different
+       L{IReactorProcess} implementations.
+    1: """
+       
+    1: from twisted.python.reflect import qual
+    1: from twisted.python.deprecate import getWarningMethod
+    1: from twisted.python.failure import Failure
+    1: from twisted.python.log import err
+    1: from twisted.persisted.styles import Ephemeral
+       
+    1: _missingProcessExited = ("Since Twisted 8.2, IProcessProtocol.processExited "
+                                "is required.  %s must implement it.")
+       
+    2: class BaseProcess(Ephemeral):
+    1:     pid = None
+    1:     status = None
+    1:     lostProcess = 0
+    1:     proto = None
+       
+    1:     def __init__(self, protocol):
+>>>>>>         self.proto = protocol
+       
+       
+    1:     def _callProcessExited(self, reason):
+>>>>>>         default = object()
+>>>>>>         processExited = getattr(self.proto, 'processExited', default)
+>>>>>>         if processExited is default:
+>>>>>>             getWarningMethod()(
+>>>>>>                 _missingProcessExited % (qual(self.proto.__class__),),
+>>>>>>                 DeprecationWarning, stacklevel=0)
+               else:
+>>>>>>             try:
+>>>>>>                 processExited(Failure(reason))
+>>>>>>             except:
+>>>>>>                 err(None, "unexpected error in processExited")
+       
+       
+    1:     def processEnded(self, status):
+               """
+               This is called when the child terminates.
+               """
+>>>>>>         self.status = status
+>>>>>>         self.lostProcess += 1
+>>>>>>         self.pid = None
+>>>>>>         self._callProcessExited(self._getReason(status))
+>>>>>>         self.maybeCallProcessEnded()
+       
+       
+    1:     def maybeCallProcessEnded(self):
+               """
+               Call processEnded on protocol after final cleanup.
+               """
+>>>>>>         if self.proto is not None:
+>>>>>>             reason = self._getReason(self.status)
+>>>>>>             proto = self.proto
+>>>>>>             self.proto = None
+>>>>>>             try:
+>>>>>>                 proto.processEnded(Failure(reason))
+>>>>>>             except:
+>>>>>>                 err(None, "unexpected error in processEnded")

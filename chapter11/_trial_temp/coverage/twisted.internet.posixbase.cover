@@ -1,0 +1,640 @@
+       # -*- test-case-name: twisted.test.test_internet,twisted.internet.test.test_posixbase -*-
+       # Copyright (c) Twisted Matrix Laboratories.
+       # See LICENSE for details.
+       
+       """
+       Posix reactor base class
+    1: """
+       
+    1: from __future__ import division, absolute_import
+       
+    1: import socket
+    1: import errno
+    1: import os
+    1: import sys
+       
+    1: from zope.interface import implementer, classImplements
+       
+    1: from twisted.python.compat import _PY3
+    1: from twisted.internet.interfaces import IReactorUNIX, IReactorUNIXDatagram
+    1: from twisted.internet.interfaces import (
+           IReactorTCP, IReactorUDP, IReactorSSL, IReactorSocket)
+    1: from twisted.internet.interfaces import IReactorProcess, IReactorMulticast
+    1: from twisted.internet.interfaces import IHalfCloseableDescriptor
+    1: from twisted.internet import error, udp, tcp
+       
+    1: from twisted.python import log, failure, util
+    1: from twisted.python.runtime import platformType, platform
+       
+    1: from twisted.internet.base import ReactorBase, _SignalReactorMixin
+    1: from twisted.internet.main import CONNECTION_DONE, CONNECTION_LOST
+       
+       # Exceptions that doSelect might return frequently
+    1: _NO_FILENO = error.ConnectionFdescWentAway('Handler has no fileno method')
+    1: _NO_FILEDESC = error.ConnectionFdescWentAway('File descriptor lost')
+       
+       
+    1: try:
+    1:     from twisted.protocols import tls
+>>>>>> except ImportError:
+>>>>>>     tls = None
+>>>>>>     try:
+>>>>>>         from twisted.internet import ssl
+>>>>>>     except ImportError:
+>>>>>>         ssl = None
+       
+    1: unixEnabled = (platformType == 'posix')
+       
+    1: processEnabled = False
+    1: if unixEnabled:
+    1:     from twisted.internet import fdesc
+           # Enable on Python 3 in ticket #5987:
+    1:     if not _PY3:
+    1:         from twisted.internet import process, _signals
+    1:         processEnabled = True
+       
+       
+    1: if platform.isWindows():
+>>>>>>     try:
+>>>>>>         import win32process
+>>>>>>         processEnabled = True
+>>>>>>     except ImportError:
+>>>>>>         win32process = None
+       
+       
+    2: class _SocketWaker(log.Logger):
+           """
+           The I{self-pipe trick<http://cr.yp.to/docs/selfpipe.html>}, implemented
+           using a pair of sockets rather than pipes (due to the lack of support in
+           select() on Windows for pipes), used to wake up the main loop from
+           another thread.
+    1:     """
+    1:     disconnected = 0
+       
+    1:     def __init__(self, reactor):
+               """Initialize.
+               """
+>>>>>>         self.reactor = reactor
+               # Following select_trigger (from asyncore)'s example;
+>>>>>>         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+>>>>>>         client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+>>>>>>         client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+>>>>>>         server.bind(('127.0.0.1', 0))
+>>>>>>         server.listen(1)
+>>>>>>         client.connect(server.getsockname())
+>>>>>>         reader, clientaddr = server.accept()
+>>>>>>         client.setblocking(0)
+>>>>>>         reader.setblocking(0)
+>>>>>>         self.r = reader
+>>>>>>         self.w = client
+>>>>>>         self.fileno = self.r.fileno
+       
+    1:     def wakeUp(self):
+               """Send a byte to my connection.
+               """
+>>>>>>         try:
+>>>>>>             util.untilConcludes(self.w.send, b'x')
+>>>>>>         except socket.error as e:
+>>>>>>             if e.args[0] != errno.WSAEWOULDBLOCK:
+>>>>>>                 raise
+       
+    1:     def doRead(self):
+               """Read some data from my connection.
+               """
+>>>>>>         try:
+>>>>>>             self.r.recv(8192)
+>>>>>>         except socket.error:
+>>>>>>             pass
+       
+    1:     def connectionLost(self, reason):
+>>>>>>         self.r.close()
+>>>>>>         self.w.close()
+       
+       
+       
+    2: class _FDWaker(log.Logger, object):
+           """
+           The I{self-pipe trick<http://cr.yp.to/docs/selfpipe.html>}, used to wake
+           up the main loop from another thread or a signal handler.
+       
+           L{_FDWaker} is a base class for waker implementations based on
+           writing to a pipe being monitored by the reactor.
+       
+           @ivar o: The file descriptor for the end of the pipe which can be
+               written to to wake up a reactor monitoring this waker.
+       
+           @ivar i: The file descriptor which should be monitored in order to
+               be awoken by this waker.
+    1:     """
+    1:     disconnected = 0
+       
+    1:     i = None
+    1:     o = None
+       
+    1:     def __init__(self, reactor):
+               """Initialize.
+               """
+    1:         self.reactor = reactor
+    1:         self.i, self.o = os.pipe()
+    1:         fdesc.setNonBlocking(self.i)
+    1:         fdesc._setCloseOnExec(self.i)
+    1:         fdesc.setNonBlocking(self.o)
+    1:         fdesc._setCloseOnExec(self.o)
+    2:         self.fileno = lambda: self.i
+       
+       
+    1:     def doRead(self):
+               """
+               Read some bytes from the pipe and discard them.
+               """
+>>>>>>         fdesc.readFromFD(self.fileno(), lambda data: None)
+       
+       
+    1:     def connectionLost(self, reason):
+               """Close both ends of my pipe.
+               """
+>>>>>>         if not hasattr(self, "o"):
+>>>>>>             return
+>>>>>>         for fd in self.i, self.o:
+>>>>>>             try:
+>>>>>>                 os.close(fd)
+>>>>>>             except IOError:
+>>>>>>                 pass
+>>>>>>         del self.i, self.o
+       
+       
+       
+    2: class _UnixWaker(_FDWaker):
+           """
+           This class provides a simple interface to wake up the event loop.
+       
+           This is used by threads or signals to wake up the event loop.
+    1:     """
+       
+    1:     def wakeUp(self):
+               """Write one byte to the pipe, and flush it.
+               """
+               # We don't use fdesc.writeToFD since we need to distinguish
+               # between EINTR (try again) and EAGAIN (do nothing).
+>>>>>>         if self.o is not None:
+>>>>>>             try:
+>>>>>>                 util.untilConcludes(os.write, self.o, b'x')
+>>>>>>             except OSError as e:
+                       # XXX There is no unit test for raising the exception
+                       # for other errnos. See #4285.
+>>>>>>                 if e.errno != errno.EAGAIN:
+>>>>>>                     raise
+       
+       
+       
+    1: if platformType == 'posix':
+    1:     _Waker = _UnixWaker
+       else:
+           # Primarily Windows and Jython.
+>>>>>>     _Waker = _SocketWaker
+       
+       
+    2: class _SIGCHLDWaker(_FDWaker):
+           """
+           L{_SIGCHLDWaker} can wake up a reactor whenever C{SIGCHLD} is
+           received.
+       
+           @see: L{twisted.internet._signals}
+    1:     """
+    1:     def __init__(self, reactor):
+>>>>>>         _FDWaker.__init__(self, reactor)
+       
+       
+    1:     def install(self):
+               """
+               Install the handler necessary to make this waker active.
+               """
+>>>>>>         _signals.installHandler(self.o)
+       
+       
+    1:     def uninstall(self):
+               """
+               Remove the handler which makes this waker active.
+               """
+>>>>>>         _signals.installHandler(-1)
+       
+       
+    1:     def doRead(self):
+               """
+               Having woken up the reactor in response to receipt of
+               C{SIGCHLD}, reap the process which exited.
+       
+               This is called whenever the reactor notices the waker pipe is
+               writeable, which happens soon after any call to the C{wakeUp}
+               method.
+               """
+>>>>>>         _FDWaker.doRead(self)
+>>>>>>         process.reapAllProcesses()
+       
+       
+       
+       
+    2: class _DisconnectSelectableMixin(object):
+           """
+           Mixin providing the C{_disconnectSelectable} method.
+    1:     """
+       
+    1:     def _disconnectSelectable(self, selectable, why, isRead, faildict={
+    1:         error.ConnectionDone: failure.Failure(error.ConnectionDone()),
+    1:         error.ConnectionLost: failure.Failure(error.ConnectionLost())
+               }):
+               """
+               Utility function for disconnecting a selectable.
+       
+               Supports half-close notification, isRead should be boolean indicating
+               whether error resulted from doRead().
+               """
+>>>>>>         self.removeReader(selectable)
+>>>>>>         f = faildict.get(why.__class__)
+>>>>>>         if f:
+>>>>>>             if (isRead and why.__class__ ==  error.ConnectionDone
+>>>>>>                 and IHalfCloseableDescriptor.providedBy(selectable)):
+>>>>>>                 selectable.readConnectionLost(f)
+                   else:
+>>>>>>                 self.removeWriter(selectable)
+>>>>>>                 selectable.connectionLost(f)
+               else:
+>>>>>>             self.removeWriter(selectable)
+>>>>>>             selectable.connectionLost(failure.Failure(why))
+       
+       
+       
+    2: @implementer(IReactorTCP, IReactorUDP, IReactorMulticast)
+    1: class PosixReactorBase(_SignalReactorMixin, _DisconnectSelectableMixin,
+    1:                        ReactorBase):
+           """
+           A basis for reactors that use file descriptors.
+       
+           @ivar _childWaker: C{None} or a reference to the L{_SIGCHLDWaker}
+               which is used to properly notice child process termination.
+    1:     """
+       
+           # Callable that creates a waker, overrideable so that subclasses can
+           # substitute their own implementation:
+    1:     _wakerFactory = _Waker
+       
+    1:     def installWaker(self):
+               """
+               Install a `waker' to allow threads and signals to wake up the IO thread.
+       
+               We use the self-pipe trick (http://cr.yp.to/docs/selfpipe.html) to wake
+               the reactor. On Windows we use a pair of sockets.
+               """
+    1:         if not self.waker:
+    1:             self.waker = self._wakerFactory(self)
+    1:             self._internalReaders.add(self.waker)
+    1:             self.addReader(self.waker)
+       
+       
+    1:     _childWaker = None
+    1:     def _handleSignals(self):
+               """
+               Extend the basic signal handling logic to also support
+               handling SIGCHLD to know when to try to reap child processes.
+               """
+>>>>>>         _SignalReactorMixin._handleSignals(self)
+>>>>>>         if platformType == 'posix' and processEnabled:
+>>>>>>             if not self._childWaker:
+>>>>>>                 self._childWaker = _SIGCHLDWaker(self)
+>>>>>>                 self._internalReaders.add(self._childWaker)
+>>>>>>                 self.addReader(self._childWaker)
+>>>>>>             self._childWaker.install()
+                   # Also reap all processes right now, in case we missed any
+                   # signals before we installed the SIGCHLD waker/handler.
+                   # This should only happen if someone used spawnProcess
+                   # before calling reactor.run (and the process also exited
+                   # already).
+>>>>>>             process.reapAllProcesses()
+       
+    1:     def _uninstallHandler(self):
+               """
+               If a child waker was created and installed, uninstall it now.
+       
+               Since this disables reactor functionality and is only called
+               when the reactor is stopping, it doesn't provide any directly
+               useful functionality, but the cleanup of reactor-related
+               process-global state that it does helps in unit tests
+               involving multiple reactors and is generally just a nice
+               thing.
+               """
+               # XXX This would probably be an alright place to put all of
+               # the cleanup code for all internal readers (here and in the
+               # base class, anyway).  See #3063 for that cleanup task.
+>>>>>>         if self._childWaker:
+>>>>>>             self._childWaker.uninstall()
+       
+           # IReactorProcess
+       
+    1:     def spawnProcess(self, processProtocol, executable, args=(),
+    1:                      env={}, path=None,
+    1:                      uid=None, gid=None, usePTY=0, childFDs=None):
+>>>>>>         args, env = self._checkProcessArgs(args, env)
+>>>>>>         if platformType == 'posix':
+>>>>>>             if usePTY:
+>>>>>>                 if childFDs is not None:
+>>>>>>                     raise ValueError("Using childFDs is not supported with usePTY=True.")
+>>>>>>                 return process.PTYProcess(self, executable, args, env, path,
+>>>>>>                                           processProtocol, uid, gid, usePTY)
+                   else:
+>>>>>>                 return process.Process(self, executable, args, env, path,
+>>>>>>                                        processProtocol, uid, gid, childFDs)
+>>>>>>         elif platformType == "win32":
+>>>>>>             if uid is not None:
+>>>>>>                 raise ValueError("Setting UID is unsupported on this platform.")
+>>>>>>             if gid is not None:
+>>>>>>                 raise ValueError("Setting GID is unsupported on this platform.")
+>>>>>>             if usePTY:
+>>>>>>                 raise ValueError("The usePTY parameter is not supported on Windows.")
+>>>>>>             if childFDs:
+>>>>>>                 raise ValueError("Customizing childFDs is not supported on Windows.")
+       
+>>>>>>             if win32process:
+>>>>>>                 from twisted.internet._dumbwin32proc import Process
+>>>>>>                 return Process(self, processProtocol, executable, args, env, path)
+                   else:
+>>>>>>                 raise NotImplementedError(
+>>>>>>                     "spawnProcess not available since pywin32 is not installed.")
+               else:
+>>>>>>             raise NotImplementedError(
+>>>>>>                 "spawnProcess only available on Windows or POSIX.")
+       
+           # IReactorUDP
+       
+    1:     def listenUDP(self, port, protocol, interface='', maxPacketSize=8192):
+               """Connects a given L{DatagramProtocol} to the given numeric UDP port.
+       
+               @returns: object conforming to L{IListeningPort}.
+               """
+>>>>>>         p = udp.Port(port, protocol, interface, maxPacketSize, self)
+>>>>>>         p.startListening()
+>>>>>>         return p
+       
+           # IReactorMulticast
+       
+    1:     def listenMulticast(self, port, protocol, interface='', maxPacketSize=8192, listenMultiple=False):
+               """Connects a given DatagramProtocol to the given numeric UDP port.
+       
+               EXPERIMENTAL.
+       
+               @returns: object conforming to IListeningPort.
+               """
+>>>>>>         p = udp.MulticastPort(port, protocol, interface, maxPacketSize, self, listenMultiple)
+>>>>>>         p.startListening()
+>>>>>>         return p
+       
+       
+           # IReactorUNIX
+       
+    1:     def connectUNIX(self, address, factory, timeout=30, checkPID=0):
+>>>>>>         assert unixEnabled, "UNIX support is not present"
+               # Move this import back up to main level when twisted.internet.unix is
+               # ported to Python 3:
+>>>>>>         from twisted.internet import unix
+>>>>>>         c = unix.Connector(address, factory, timeout, self, checkPID)
+>>>>>>         c.connect()
+>>>>>>         return c
+       
+    1:     def listenUNIX(self, address, factory, backlog=50, mode=0o666, wantPID=0):
+>>>>>>         assert unixEnabled, "UNIX support is not present"
+               # Move this import back up to main level when twisted.internet.unix is
+               # ported to Python 3:
+>>>>>>         from twisted.internet import unix
+>>>>>>         p = unix.Port(address, factory, backlog, mode, self, wantPID)
+>>>>>>         p.startListening()
+>>>>>>         return p
+       
+       
+           # IReactorUNIXDatagram
+       
+    1:     def listenUNIXDatagram(self, address, protocol, maxPacketSize=8192,
+    1:                            mode=0o666):
+               """
+               Connects a given L{DatagramProtocol} to the given path.
+       
+               EXPERIMENTAL.
+       
+               @returns: object conforming to L{IListeningPort}.
+               """
+>>>>>>         assert unixEnabled, "UNIX support is not present"
+               # Move this import back up to main level when twisted.internet.unix is
+               # ported to Python 3:
+>>>>>>         from twisted.internet import unix
+>>>>>>         p = unix.DatagramPort(address, protocol, maxPacketSize, mode, self)
+>>>>>>         p.startListening()
+>>>>>>         return p
+       
+    1:     def connectUNIXDatagram(self, address, protocol, maxPacketSize=8192,
+    1:                             mode=0o666, bindAddress=None):
+               """
+               Connects a L{ConnectedDatagramProtocol} instance to a path.
+       
+               EXPERIMENTAL.
+               """
+>>>>>>         assert unixEnabled, "UNIX support is not present"
+               # Move this import back up to main level when twisted.internet.unix is
+               # ported to Python 3:
+>>>>>>         from twisted.internet import unix
+>>>>>>         p = unix.ConnectedDatagramPort(address, protocol, maxPacketSize, mode, bindAddress, self)
+>>>>>>         p.startListening()
+>>>>>>         return p
+       
+       
+           # IReactorSocket (but not on Windows)
+       
+    1:     def adoptStreamPort(self, fileDescriptor, addressFamily, factory):
+               """
+               Create a new L{IListeningPort} from an already-initialized socket.
+       
+               This just dispatches to a suitable port implementation (eg from
+               L{IReactorTCP}, etc) based on the specified C{addressFamily}.
+       
+               @see: L{twisted.internet.interfaces.IReactorSocket.adoptStreamPort}
+               """
+>>>>>>         if addressFamily not in (socket.AF_INET, socket.AF_INET6):
+>>>>>>             raise error.UnsupportedAddressFamily(addressFamily)
+       
+>>>>>>         p = tcp.Port._fromListeningDescriptor(
+>>>>>>             self, fileDescriptor, addressFamily, factory)
+>>>>>>         p.startListening()
+>>>>>>         return p
+       
+    1:     def adoptStreamConnection(self, fileDescriptor, addressFamily, factory):
+               """
+               @see:
+                   L{twisted.internet.interfaces.IReactorSocket.adoptStreamConnection}
+               """
+>>>>>>         if addressFamily not in (socket.AF_INET, socket.AF_INET6):
+>>>>>>             raise error.UnsupportedAddressFamily(addressFamily)
+       
+>>>>>>         return tcp.Server._fromConnectedSocket(
+>>>>>>             fileDescriptor, addressFamily, factory, self)
+       
+       
+           def adoptDatagramPort(self, fileDescriptor, addressFamily, protocol,
+    1:                           maxPacketSize=8192):
+>>>>>>         if addressFamily not in (socket.AF_INET, socket.AF_INET6):
+>>>>>>             raise error.UnsupportedAddressFamily(addressFamily)
+       
+>>>>>>         p = udp.Port._fromListeningDescriptor(
+>>>>>>             self, fileDescriptor, addressFamily, protocol,
+>>>>>>             maxPacketSize=maxPacketSize)
+>>>>>>         p.startListening()
+>>>>>>         return p
+       
+       
+       
+           # IReactorTCP
+       
+    1:     def listenTCP(self, port, factory, backlog=50, interface=''):
+>>>>>>         p = tcp.Port(port, factory, backlog, interface, self)
+>>>>>>         p.startListening()
+>>>>>>         return p
+       
+    1:     def connectTCP(self, host, port, factory, timeout=30, bindAddress=None):
+>>>>>>         c = tcp.Connector(host, port, factory, timeout, bindAddress, self)
+>>>>>>         c.connect()
+>>>>>>         return c
+       
+           # IReactorSSL (sometimes, not implemented)
+       
+    1:     def connectSSL(self, host, port, factory, contextFactory, timeout=30, bindAddress=None):
+>>>>>>         if tls is not None:
+>>>>>>             tlsFactory = tls.TLSMemoryBIOFactory(contextFactory, True, factory)
+>>>>>>             return self.connectTCP(host, port, tlsFactory, timeout, bindAddress)
+>>>>>>         elif ssl is not None:
+>>>>>>             c = ssl.Connector(
+>>>>>>                 host, port, factory, contextFactory, timeout, bindAddress, self)
+>>>>>>             c.connect()
+>>>>>>             return c
+               else:
+>>>>>>             assert False, "SSL support is not present"
+       
+       
+       
+    1:     def listenSSL(self, port, factory, contextFactory, backlog=50, interface=''):
+>>>>>>         if tls is not None:
+>>>>>>             tlsFactory = tls.TLSMemoryBIOFactory(contextFactory, False, factory)
+>>>>>>             port = self.listenTCP(port, tlsFactory, backlog, interface)
+>>>>>>             port._type = 'TLS'
+>>>>>>             return port
+>>>>>>         elif ssl is not None:
+>>>>>>             p = ssl.Port(
+>>>>>>                 port, factory, contextFactory, backlog, interface, self)
+>>>>>>             p.startListening()
+>>>>>>             return p
+               else:
+>>>>>>             assert False, "SSL support is not present"
+       
+       
+    1:     def _removeAll(self, readers, writers):
+               """
+               Remove all readers and writers, and list of removed L{IReadDescriptor}s
+               and L{IWriteDescriptor}s.
+       
+               Meant for calling from subclasses, to implement removeAll, like::
+       
+                 def removeAll(self):
+                     return self._removeAll(self._reads, self._writes)
+       
+               where C{self._reads} and C{self._writes} are iterables.
+               """
+    4:         removedReaders = set(readers) - self._internalReaders
+    4:         for reader in removedReaders:
+>>>>>>             self.removeReader(reader)
+       
+    4:         removedWriters = set(writers)
+    4:         for writer in removedWriters:
+>>>>>>             self.removeWriter(writer)
+       
+    4:         return list(removedReaders | removedWriters)
+       
+       
+    2: class _PollLikeMixin(object):
+           """
+           Mixin for poll-like reactors.
+       
+           Subclasses must define the following attributes::
+       
+             - _POLL_DISCONNECTED - Bitmask for events indicating a connection was
+               lost.
+             - _POLL_IN - Bitmask for events indicating there is input to read.
+             - _POLL_OUT - Bitmask for events indicating output can be written.
+       
+           Must be mixed in to a subclass of PosixReactorBase (for
+           _disconnectSelectable).
+    1:     """
+       
+    1:     def _doReadOrWrite(self, selectable, fd, event):
+               """
+               fd is available for read or write, do the work and raise errors if
+               necessary.
+               """
+>>>>>>         why = None
+>>>>>>         inRead = False
+>>>>>>         if event & self._POLL_DISCONNECTED and not (event & self._POLL_IN):
+                   # Handle disconnection.  But only if we finished processing all
+                   # the pending input.
+>>>>>>             if fd in self._reads:
+                       # If we were reading from the descriptor then this is a
+                       # clean shutdown.  We know there are no read events pending
+                       # because we just checked above.  It also might be a
+                       # half-close (which is why we have to keep track of inRead).
+>>>>>>                 inRead = True
+>>>>>>                 why = CONNECTION_DONE
+                   else:
+                       # If we weren't reading, this is an error shutdown of some
+                       # sort.
+>>>>>>                 why = CONNECTION_LOST
+               else:
+                   # Any non-disconnect event turns into a doRead or a doWrite.
+>>>>>>             try:
+                       # First check to see if the descriptor is still valid.  This
+                       # gives fileno() a chance to raise an exception, too.
+                       # Ideally, disconnection would always be indicated by the
+                       # return value of doRead or doWrite (or an exception from
+                       # one of those methods), but calling fileno here helps make
+                       # buggy applications more transparent.
+>>>>>>                 if selectable.fileno() == -1:
+                           # -1 is sort of a historical Python artifact.  Python
+                           # files and sockets used to change their file descriptor
+                           # to -1 when they closed.  For the time being, we'll
+                           # continue to support this anyway in case applications
+                           # replicated it, plus abstract.FileDescriptor.fileno
+                           # returns -1.  Eventually it'd be good to deprecate this
+                           # case.
+>>>>>>                     why = _NO_FILEDESC
+                       else:
+>>>>>>                     if event & self._POLL_IN:
+                               # Handle a read event.
+>>>>>>                         why = selectable.doRead()
+>>>>>>                         inRead = True
+>>>>>>                     if not why and event & self._POLL_OUT:
+                               # Handle a write event, as long as doRead didn't
+                               # disconnect us.
+>>>>>>                         why = selectable.doWrite()
+>>>>>>                         inRead = False
+>>>>>>             except:
+                       # Any exception from application code gets logged and will
+                       # cause us to disconnect the selectable.
+>>>>>>                 why = sys.exc_info()[1]
+>>>>>>                 log.err()
+>>>>>>         if why:
+>>>>>>             self._disconnectSelectable(selectable, why, inRead)
+       
+       
+       
+    1: if tls is not None or ssl is not None:
+    1:     classImplements(PosixReactorBase, IReactorSSL)
+    1: if unixEnabled:
+    1:     classImplements(PosixReactorBase, IReactorUNIX, IReactorUNIXDatagram)
+    1: if processEnabled:
+    1:     classImplements(PosixReactorBase, IReactorProcess)
+    1: if getattr(socket, 'fromfd', None) is not None:
+    1:     classImplements(PosixReactorBase, IReactorSocket)
+       
+    1: __all__ = ["PosixReactorBase"]

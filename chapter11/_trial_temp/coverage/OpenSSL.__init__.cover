@@ -1,0 +1,45 @@
+       # Copyright (C) AB Strakt
+       # See LICENSE for details.
+       
+       """
+       pyOpenSSL - A simple wrapper around the OpenSSL library
+    1: """
+       
+    1: import sys
+       
+    1: try:
+    1:     orig = sys.getdlopenflags()
+>>>>>> except AttributeError:
+>>>>>>     from OpenSSL import crypto
+       else:
+    1:     try:
+    1:         import DLFCN
+>>>>>>     except ImportError:
+>>>>>>         try:
+>>>>>>             import dl
+>>>>>>         except ImportError:
+>>>>>>             try:
+>>>>>>                 import ctypes
+>>>>>>             except ImportError:
+>>>>>>                 flags = 2 | 256
+                   else:
+>>>>>>                 flags = 2 | ctypes.RTLD_GLOBAL
+>>>>>>                 del ctypes
+               else:
+>>>>>>             flags = dl.RTLD_NOW | dl.RTLD_GLOBAL
+>>>>>>             del dl
+           else:
+    1:         flags = DLFCN.RTLD_NOW | DLFCN.RTLD_GLOBAL
+    1:         del DLFCN
+       
+    1:     sys.setdlopenflags(flags)
+    1:     from OpenSSL import crypto
+    1:     sys.setdlopenflags(orig)
+    1:     del orig, flags
+    1: del sys
+       
+    1: from OpenSSL import rand, SSL
+    1: from OpenSSL.version import __version__
+       
+       __all__ = [
+    1:     'rand', 'crypto', 'SSL', 'tsafe', '__version__']
