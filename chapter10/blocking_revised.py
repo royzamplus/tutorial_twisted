@@ -21,8 +21,8 @@ def finish():
 
 d = threads.deferToThread(blockingApiCall, "Goose")
 d.addCallback(printResult)
+d.addCallback(finish)
 
 LoopingCall(nonblockingCall, "Duck").start(.25)
 
-reactor.callLater(2, finish)
 reactor.run()
